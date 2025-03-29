@@ -1,0 +1,584 @@
+#!/usr/bin/env python
+
+from helper_code import *
+import numpy as np
+import os
+import sys
+import pickle
+from model_code import *
+from model.blocks import FinalModel
+from scipy.stats import zscore
+from scipy.optimize import differential_evolution
+from sklearn.metrics import precision_recall_curve, roc_curve
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import copy
+import pandas as pd
+import mne  # Import MNE for EDF file handling
+
+np.random.seed(0)
+
+DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+bsize = 16
+
+################################################################################
+#
+# Training function
+#
+################################################################################
+
+class optim_genetics:
+    def __init__(self, target, outputs, classes):
+        self.target = target
+        self.outputs = outputs
+        weights_file = './weights.csv'
+        
+        # Define AFib vs. Non-AFib
+        self.afib_class = '164889003'  # AFib class code
+        self.non_afib_class = 'Non-AFib'
+        
+        print('Loading weights...')
+        _, self.weights = load_weights(weights_file)
+
+        # Convert multi-class labels to binary labels
+        self.classes = ['Non-AFib', 'AFib']
+        self.target = self.convert_to_binary(target, classes)
+        self.outputs = self.convert_to_binary(outputs, classes)
+
+    def convert_to_binary(self, data, class_list):
+        """ Convert multi-class labels into binary (AFib=1, Non-AFib=0). """
+        afib_idx = class_list.index(self.afib_class)
+        binary_labels = (data[:, afib_idx] > 0).astype(int)  # AFib=1, else=0
+        return np.expand_dims(binary_labels, axis=1)
+
+    def __call__(self, x):
+        outputs = copy.deepcopy(self.outputs)
+        outputs = outputs > x
+        outputs = np.array(outputs, dtype=int)
+        return -compute_challenge_metric(self.weights, self.target, outputs, self.classes, self.non_afib_class)
+
+def find_thresholds(filename, model_directory):
+    with open(filename, 'rb') as handle:
+        models = pickle.load(handle)
+        train_files = pickle.load(handle)
+        valid_files = pickle.load(handle)
+        classes = pickle.load(handle)
+        lossweights = pickle.load(handle)
+
+    results = pd.DataFrame(models)
+    results.drop(columns=['model'], inplace=True)
+
+    model_idx = np.argmax(results[:]['valid_auprc'])
+    t = results.iloc[model_idx]['valid_targets']
+    y = results.iloc[model_idx]['valid_outputs']
+
+    # Binary threshold calculation for AFib vs. Non-AFib
+    prc, rec, thr = precision_recall_curve(y_true=t[:, 0], probas_pred=y[:, 0])
+    fscore = 2 * prc * rec / (prc + rec)
+    idx = np.nanargmax(fscore)
+    best_threshold = thr[idx]
+
+    print(f"Best threshold: {best_threshold}")
+    select4deployment(models[model_idx]['model'], thresholds=[best_threshold],
+                      classes=['Non-AFib', 'AFib'], info='', model_directory=model_directory)
+
+def select4deployment(state_dict, thresholds, classes, info, model_directory):
+    select4deployment.calls += 1
+    name = os.path.join(model_directory, f'MODEL_{select4deployment.calls}.pickle')
+    with open(name, 'wb') as handle:
+        model = FinalModel(num_classes=2)  # Binary classification
+        model.load_state_dict(state_dict)
+        model.cpu()
+        model.eval()
+
+        pickle.dump({'state_dict': model.state_dict(),
+                     'classes': classes,
+                     'thresholds': thresholds,
+                     'info': info}, handle,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+
+select4deployment.calls = 0  # Initialize call count
+
+################################################################################
+#
+# Define Model
+#
+################################################################################
+
+class FinalModel(nn.Module):
+    def __init__(self, num_classes=2):  # Only AFib vs. Non-AFib
+        super(FinalModel, self).__init__()
+        self.fc = nn.Linear(512, num_classes)  # Adjust final layer
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        x = self.fc(x)
+        return self.softmax(x)
+
+################################################################################
+#
+# Loss Function
+#
+################################################################################
+
+class challengeloss(nn.Module):
+    def __init__(self):
+        super(challengeloss, self).__init__()
+
+    def forward(self, L, P):
+        return nn.functional.binary_cross_entropy_with_logits(P, L)
+
+################################################################################
+#
+# Helper Functions
+#
+################################################################################
+
+def get_nsamp(header):
+    return int(header.split('\n')[0].split(' ')[3])
+
+def load_edf(file_path):
+    """ Load EDF file and return signals and sampling frequency. """
+    try:
+        raw = mne.io.read_raw_edf(file_path, preload=True)
+        signals = raw.get_data()  # Extract signal data
+        sfreq = raw.info['sfreq']  # Sampling frequency
+        return signals, sfreq
+    except Exception as e:
+        print(f"Error loading EDF file {file_path}: {e}")
+        return None, None
+
+
+class dataset:
+    classes = ['164889003', '164890007', '6374002', '426627000', '733534002',
+               '713427006', '270492004', '713426002', '39732003', '445118002',
+               '164947007', '251146004', '111975006', '698252002', '426783006',
+               '284470004', '10370003', '365413008', '427172004', '164917005',
+               '47665007', '427393009', '426177001', '427084000', '164934002',
+               '59931005']
+    normal_class = '426783006'
+    equivalent_classes = [['713427006', '59118001'],
+                          ['284470004', '63593006'],
+                          ['427172004', '17338001'],
+                          ['733534002', '164909002']]
+
+    def __init__(self, header_files):
+        self.files = []
+        self.sample = True
+        self.num_leads = None
+        for h in tqdm(header_files):
+            tmp = dict()
+            tmp['header'] = h
+            if h.endswith('.hea'):
+                tmp['record'] = h.replace('.hea', '.mat')
+            elif h.endswith('.edf'):
+                tmp['record'] = h.replace('.hea', '.edf')
+            hdr = load_header(h)
+            tmp['nsamp'] = get_nsamp(hdr)
+            tmp['leads'] = get_leads(hdr)
+            tmp['age'] = get_age(hdr)
+            tmp['sex'] = get_sex(hdr)
+            tmp['dx'] = get_labels(hdr)
+            tmp['fs'] = get_frequency(hdr)
+            tmp['target'] = np.zeros((26,))
+            tmp['dx'] = replace_equivalent_classes(
+                tmp['dx'], dataset.equivalent_classes)
+            for dx in tmp['dx']:
+                if dx in dataset.classes:
+                    idx = dataset.classes.index(dx)
+                    tmp['target'][idx] = 1
+            self.files.append(tmp)
+
+        self.b, self.a = signal.butter(3, [1 / 250, 47 / 250], 'bandpass')
+
+        self.files = pd.DataFrame(self.files)
+
+    def train_valid_split(self, test_size):
+        files = self.files['header'].to_numpy().reshape(-1, 1)
+        targets = np.stack(self.files['target'].to_list(), axis=0)
+        x_train, y_train, x_valid, y_valid = iterative_train_test_split(
+            files, targets, test_size=test_size)
+        train = dataset(header_files=x_train[:, 0].tolist())
+        train.num_leads = None
+        train.sample = True
+        valid = dataset(header_files=x_valid[:, 0].tolist())
+        valid.num_leads = 12
+        valid.sample = False
+        return train, valid
+
+    def summary(self, output):
+        if output == 'pandas':
+            return pd.Series(np.stack(self.files['target'].to_list(), axis=0).sum(axis=0), index=dataset.classes)
+        if output == 'numpy':
+            return np.stack(self.files['target'].to_list(), axis=0).sum(axis=0)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, item):
+        fs = self.files.iloc[item]['fs']
+        target = self.files.iloc[item]['target']
+        leads = self.files.iloc[item]['leads']
+        record_path = self.files.iloc[item]['record']
+
+        if record_path.endswith('.mat'):
+            data = load_recording(record_path)
+        elif record_path.endswith('.edf'):
+            data, fs = load_edf(record_path)
+
+        data, lead_indicator = expand_leads(data, input_leads=leads)
+        data = np.nan_to_num(data)
+
+        if fs == float(1000):
+            data = signal.resample_poly(
+                data, up=1, down=2, axis=-1)
+            fs = 500
+        elif fs == float(500):
+            pass
+        else:
+            data = signal.resample(data, int(data.shape[1] * 500 / fs), axis=1)
+            fs = 500
+
+        data = signal.filtfilt(self.b, self.a, data)
+
+        if self.sample:
+            fs = int(fs)
+            if data.shape[-1] >= 8192:
+                idx = data.shape[-1] - 8192-1
+                idx = np.random.randint(idx)
+                data = data[:, idx:idx + 8192]
+
+        mu = np.nanmean(data, axis=-1, keepdims=True)
+        std = np.nanstd(data, axis=-1, keepdims=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = (data - mu) / std
+        data = np.nan_to_num(data)
+
+        data, lead_indicator = lead_exctractor.get(
+            data, self.num_leads, lead_indicator)
+
+        return data, target, lead_indicator
+
+def expand_leads(recording, input_leads):
+    output = np.zeros((12, recording.shape[1]))
+    twelve_leads = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF',
+                    'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+    twelve_leads = [k.lower() for k in twelve_leads]
+
+    input_leads = [k.lower() for k in input_leads]
+    output_leads = np.zeros((12,))
+    for i, k in enumerate(input_leads):
+        idx = twelve_leads.index(k)
+        output[idx, :] = recording[i, :]
+        output_leads[idx] = 1
+    return output, output_leads
+
+def load_edf(file_path):
+    import mne
+    try:
+        raw = mne.io.read_raw_edf(file_path, preload=True)
+        data = raw.get_data()
+        fs = raw.info['sfreq']
+        return data, fs
+    except Exception as e:
+        print(f"Error loading EDF file {file_path}: {e}")
+        return None, None
+
+class lead_extractor:
+    """
+    Used to select specific leads or randomly choose configurations.
+
+    Twelve leads: I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6
+    Six leads: I, II, III, aVR, aVL, aVF
+    Four leads: I, II, III, V2
+    Three leads: I, II, V2
+    Two leads: I, II
+    """
+    L2 = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    L3 = np.array([1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
+    L4 = np.array([1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0])
+    L6 = np.array([1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+    L8 = np.array([1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1])
+    L12 = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+
+    @staticmethod
+    def get(x, num_leads, lead_indicator):
+        if num_leads is None:
+            num_leads = random.choice([12, 8, 6, 4, 3, 2])
+
+        lead_masks = {
+            12: lead_extractor.L12,
+            8: lead_extractor.L8,
+            6: lead_extractor.L6,
+            4: lead_extractor.L4,
+            3: lead_extractor.L3,
+            2: lead_extractor.L2,
+        }
+        
+        if num_leads in lead_masks:
+            x = x * lead_masks[num_leads].reshape(12, 1)
+            return x, lead_indicator * lead_masks[num_leads]
+        
+        raise ValueError("Invalid number of leads.")
+
+
+def collate(batch):
+    ch = batch[0][0].shape[0]
+    maxL = 8192
+    X = np.zeros((len(batch), ch, maxL))
+    for i in range(len(batch)):
+        X[i, :, -batch[i][0].shape[-1]:] = batch[i][0]
+    t = np.array([b[1] for b in batch])
+    l = np.concatenate([b[2].reshape(1, 12) for b in batch], axis=0)
+
+    X = torch.from_numpy(X).float()
+    t = torch.from_numpy(t).float()
+    l = torch.from_numpy(l).float()
+    return X, t, l
+
+
+def replace_equivalent_classes(classes, equivalent_classes):
+    for j, x in enumerate(classes):
+        for multiple_classes in equivalent_classes:
+            if x in multiple_classes:
+                classes[j] = multiple_classes[0]
+    return classes
+
+
+def valid_part(model, dataset):
+    targets = []
+    outputs = []
+    weights_file = 'weights.csv'
+    sinus_rhythm = {'426783006'}
+
+    classes, weights = load_weights(weights_file)
+    model.eval()
+    with torch.no_grad():
+        for i, (x, t, l) in enumerate(tqdm(dataset)):
+            x = x.unsqueeze(2).float().to(DEVICE)
+            t = t.to(DEVICE)
+            l = l.float().to(DEVICE)
+
+            y = model(x, l)
+
+            targets.append(t.cpu().numpy())
+            outputs.append(y.cpu().numpy())
+    
+    targets = np.concatenate(targets, axis=0)
+    outputs = np.concatenate(outputs, axis=0)
+    auprc = average_precision_score(y_true=targets, y_score=outputs)
+    challenge_metric = compute_challenge_metric(weights, targets, outputs, classes, sinus_rhythm)
+    return auprc, targets, outputs, challenge_metric
+
+
+def train_part(model, dataset, loss_fn, optimizer):
+    targets = []
+    outputs = []
+    model.train()
+    chloss = ChallengeLoss()
+    
+    with mytqdm(dataset) as pbar:
+        for i, (x, t, l) in enumerate(pbar):
+            optimizer.zero_grad()
+
+            x = x.unsqueeze(2).float().to(DEVICE)
+            t = t.to(DEVICE)
+            l = l.float().to(DEVICE)
+
+            y = model(x, l)
+
+            J = -torch.mean(t * F.logsigmoid(y) + (1 - t) * F.logsigmoid(-y) * 0.1)
+            J.backward()
+            
+            pbar.set_postfix(loss=J.item())
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
+            optimizer.step()
+
+            targets.append(t.cpu().numpy())
+            outputs.append(y.cpu().numpy())
+
+        targets = np.concatenate(targets, axis=0)
+        outputs = np.concatenate(outputs, axis=0)
+        auprc = average_precision_score(y_true=targets, y_score=outputs)
+
+    return auprc
+
+
+def training_code(data_directory, model_directory):
+    select4deployment.calls = 0
+    for i in range(3):  
+        _training_code(data_directory, model_directory, str(i))
+
+
+def _training_code(data_directory, model_directory, ensemble_ID):
+    print('Finding header and recording files...')
+
+    header_files, recording_files = find_challenge_files(data_directory)
+    full_dataset = CustomECGDataset(header_files)
+
+    print(full_dataset.summary('pandas'))
+    train, valid = full_dataset.train_valid_split(test_size=0.05)
+
+    valid.files = valid.files[valid.files['nsamp'] <= 8192]
+    valid.files.reset_index(drop=True, inplace=True)
+
+    loss_weight = (len(train) - train.summary(output='numpy')) / train.summary(output='numpy')
+
+    train_files = [Path(k).name for k in train.files['header'].to_list()]
+    valid_files = [Path(k).name for k in valid.files['header'].to_list()]
+
+    os.makedirs(model_directory, exist_ok=True)
+
+    train_loader = DataLoader(dataset=train, batch_size=bsize, shuffle=True, 
+                              num_workers=8, collate_fn=collate, pin_memory=True, drop_last=False)
+
+    valid_loader = DataLoader(dataset=valid, batch_size=bsize, shuffle=False, 
+                              num_workers=8, collate_fn=collate, pin_memory=True, drop_last=False)
+
+    model = FinalModel(num_classes=26).to(DEVICE)
+    
+    if model_path is not None:
+        model.load_state_dict(torch.load(model_path))
+        print('Model Loaded!')
+
+    lossBCE = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(loss_weight).to(DEVICE))
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+
+    OUTPUT = []
+    EPOCHS = 100
+    
+    for epoch in range(EPOCHS):
+        print(f"============================[{epoch}]============================")
+        train_auprc = train_part(model, train_loader, lossBCE, optimizer)
+        print(f"Train AUPRC: {train_auprc}")
+
+        valid_auprc, valid_targets, valid_outputs, challenge_metric = valid_part(model, valid_loader)
+        print(f"Validation AUPRC: {valid_auprc}")
+
+        OUTPUT.append({
+            'epoch': epoch,
+            'model': copy.deepcopy(model).cpu().state_dict(),
+            'train_auprc': train_auprc,
+            'valid_auprc': valid_auprc,
+            'valid_targets': valid_targets,
+            'valid_outputs': valid_outputs,
+            'val_challenge_metric': challenge_metric
+        })
+
+        scheduler.step()
+        
+        progress_path = Path(model_directory, f'PROGRESS_{ensemble_ID}.pickle')
+        with open(progress_path, 'wb') as handle:
+            pickle.dump(OUTPUT, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(train_files, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(valid_files, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(dataset.classes, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(loss_weight, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    find_thresholds(progress_path, model_directory)
+
+# Generic function for loading a model.
+def _load_model(model_directory, id):
+    filename = Path(model_directory, f'MODEL_{id}.pickle')
+    model = {}
+    with open(filename, 'rb') as handle:
+        input = pickle.load(handle)
+
+    model['classifier'] = FinalModel(num_classes=26).to(DEVICE)
+    model['classifier'].load_state_dict(input['state_dict'])
+    model['classifier'].eval()
+    model['thresholds'] = input['thresholds']
+    model['classes'] = input['classes']
+    return model
+
+
+def load_model(model_directory, leads):
+    model = {}
+    model['1'] = _load_model(model_directory, 1)
+    # model['2'] = _load_model(model_directory, 2)
+    # model['3'] = _load_model(model_directory, 3)
+    return model
+
+
+################################################################################
+#
+# Running trained model functions
+#
+################################################################################
+
+
+def expand_leads(recording, input_leads):
+    output = np.zeros((12, recording.shape[1]))
+    twelve_leads = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF',
+                    'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+    twelve_leads = [k.lower() for k in twelve_leads]
+
+    input_leads = [k.lower() for k in input_leads]
+    output_leads = np.zeros((12,))
+    for i, k in enumerate(input_leads):
+        idx = twelve_leads.index(k)
+        output[idx, :] = recording[i, :]
+        output_leads[idx] = 1
+    return output, output_leads
+
+
+def zeropad(x):
+    y = np.zeros((12, 8192))
+    if x.shape[1] < 8192:
+        y[:, -x.shape[1]:] = x
+    else:
+        y = x[:, :8192]
+    return y
+
+
+def preprocessing(recording, leads, fs):
+    b, a = signal.butter(3, [1 / 250, 47 / 250], 'bandpass')
+
+    if fs == 1000:
+        recording = signal.resample_poly(recording, up=1, down=2, axis=-1)  # to 500Hz
+        fs = 500
+    elif fs != 500:
+        recording = signal.resample(recording, int(recording.shape[1] * 500 / fs), axis=1)
+        print(f'RESAMPLING FROM {fs} TO 500')
+        fs = 500
+
+    recording = signal.filtfilt(b, a, recording)
+    recording = zscore(recording, axis=-1)
+    recording = np.nan_to_num(recording)
+    recording = zeropad(recording)
+    recording = torch.from_numpy(recording).view(1, 12, 1, -1).float().to(DEVICE)
+    leads = torch.from_numpy(leads).float().view(1, 12).to(DEVICE)
+    return recording, leads
+
+
+# Generic function for running a trained model.
+def run_model(model, header, recording):
+    input_leads = get_leads(header)
+    recording, leads = expand_leads(recording, input_leads)
+    recording, leads = preprocessing(recording, leads, fs=get_frequency(header))
+
+    classes = model['1']['classes']
+    out_labels = np.zeros((len(model), 26))
+
+    for i, (key, mod) in enumerate(model.items()):
+        thresholds = mod['thresholds']
+        classifier = mod['classifier']
+
+        q = classifier(recording, leads).data[0, :].cpu().numpy()
+        labels = q >= thresholds
+        out_labels[i, :] = labels
+
+    labels = np.sum(out_labels, axis=0)
+    labels = np.array(labels, dtype=np.int32)
+    return classes, labels, q
+
+################################################################################
+#
+# Other functions
+#
+################################################################################
